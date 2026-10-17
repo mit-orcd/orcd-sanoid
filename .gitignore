@@ -1,0 +1,6 @@
+# Upstream Sanoid checkout. A fresh clone of this repo has no sanoid/
+# directory; install-sanoid-rhel.sh clones
+# https://github.com/jimsalterjrs/sanoid.git into it.
+/sanoid/
+
+.DS_Store

@@ -1,0 +1,1304 @@
+#!/usr/bin/env bash
+# Build /etc/sanoid/sanoid.conf from the ZFS dataset list.
+#
+# Pool roots are omitted: a snapshot of "data1" does not include data1/edboyden.
+# sanoid-discover.service runs "sanoid-config sync". A new dataset such as
+# data1/xyz or data1/xyz/abc is configured with template_production and
+# com.sun:auto-snapshot is set to true:
+#
+#   [data1/xyz]
+#           use_template = production
+#
+# A dataset with com.sun:auto-snapshot=false is left out, so disable stays off.
+#
+# Hourly, daily, and monthly counts are set once in [template_production]
+# inside sanoid.conf.template. The master copy of that template is sanoid.conf
+# in the orcd-sanoid directory, not the upstream file in the sanoid/ checkout.
+# Per-dataset exceptions are stored in sanoid-overrides.conf:
+#
+#   sanoid-config enable data1/orcd
+#   sanoid-config set data1/edboyden hourly=6 daily=7
+#   sanoid-config ignore data1/scratch
+#   sanoid-config template set hourly=4
+#
+# sanoid-discover.service runs "sanoid-config sync" on a timer. The same
+# command is what an operator runs by hand.
+
+set -euo pipefail
+
+CONF_DIR=${SANOID_CONF_DIR:-/etc/sanoid}
+FROM_LIST=""
+DRY=0
+FORCE=0
+QUIET=0
+COMMAND=""
+ORIG_ARGS=("$@")
+ARGS=()
+LOCK_DIR=""
+LOCKED=0
+TMP_LIST=""
+TMP_RENDER=""
+
+usage() {
+  cat <<'EOF'
+Usage: sanoid-config <command> [options]
+
+Rebuild /etc/sanoid/sanoid.conf from `zfs list`. A new dataset such as
+data1/xyz or data1/xyz/abc is included and com.sun:auto-snapshot is set
+to true. Pool roots are left out. Each included dataset uses
+template_production. Retention counts are edited in [template_production],
+not copied onto every dataset. A dataset whose property is false stays out.
+
+Commands:
+  sync [--dry-run] [--force]
+                         Rewrite sanoid.conf from the current ZFS list.
+  list                   Show each dataset and whether it is configured.
+  show DATASET           Print the sanoid.conf section for one dataset.
+  enable DATASET ...     zfs set com.sun:auto-snapshot=true, then sync.
+  disable DATASET ...    zfs set com.sun:auto-snapshot=false, then sync.
+  set DATASET KEY=VALUE ...
+                         Override template settings for one dataset.
+  unset DATASET [KEY ...]
+                         Remove overrides. With no keys, remove all of them.
+  ignore DATASET ...     Leave these datasets out of sanoid.conf.
+  unignore DATASET ...   Discover these datasets again.
+  template show          Print [template_production] (or default_template).
+  template set KEY=VALUE ...
+                         Change that template, then sync.
+
+Options:
+  --conf-dir DIR         Config directory (default: /etc/sanoid).
+  --from-list FILE       Read a zfs list instead of running zfs. The property
+                         is not changed. Machine format is:
+                           name <TAB> type <TAB> com.sun:auto-snapshot
+                         A missing property column is treated as a new dataset.
+  --dry-run              Print the config that would be written.
+  --force                Replace a sanoid.conf that sanoid-config did not write.
+  --quiet                Suppress the "up to date" line. Changes are still printed.
+  -h, --help             Show this help.
+
+Examples:
+  sanoid-config list
+  sanoid-config enable data1/edboyden data1/orcd
+  sanoid-config set data1/edboyden hourly=6 daily=7
+  sanoid-config set data1/orcd use_template=backup
+  sanoid-config set data1/edboyden recursive=yes
+  sanoid-config ignore data1/scratch
+  sanoid-config template set hourly=4 daily=2 monthly=1
+  sanoid-config sync --dry-run
+
+Files:
+  /etc/sanoid/sanoid.conf              Generated. Do not edit dataset sections.
+  /etc/sanoid/sanoid.conf.template     Templates. Uniform retention lives here.
+  /etc/sanoid/sanoid-discover.conf     depth, pools, and exclude globs.
+  /etc/sanoid/sanoid-overrides.conf    Per-dataset keys. Edited by set/ignore.
+
+A sanoid.conf that was written by hand is left unchanged until
+"sanoid-config sync --force". The sample [data1/test] section is replaced.
+EOF
+}
+
+log() {
+  printf '%s\n' "$*"
+}
+
+warn() {
+  printf 'WARNING: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+refuse() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+info() {
+  if [[ "$DRY" -eq 1 ]]; then
+    printf '%s\n' "$*" >&2
+  else
+    printf '%s\n' "$*"
+  fi
+}
+
+cleanup() {
+  if [[ -n "${LOCK_DIR}" ]]; then
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
+    LOCK_DIR=""
+  fi
+  if [[ -n "${TMP_LIST}" ]]; then
+    rm -f "${TMP_LIST}"
+    TMP_LIST=""
+  fi
+  if [[ -n "${TMP_RENDER}" ]]; then
+    rm -f "${TMP_RENDER}"
+    TMP_RENDER=""
+  fi
+  return 0
+}
+trap cleanup EXIT
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  printf '%s' "$s"
+}
+
+file_mtime() {
+  local path=$1
+  if stat -c %Y "$path" >/dev/null 2>&1; then
+    stat -c %Y "$path"
+  else
+    stat -f %m "$path"
+  fi
+}
+
+name_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9_.:-]+(/[A-Za-z0-9_.:-]+)*$ ]]
+}
+
+dataset_name_ok() {
+  name_ok "$1" && [[ "$1" == */* ]]
+}
+
+is_yes() {
+  local v
+  v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$v" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# yes: already enabled. no: explicitly disabled. unset: a new dataset.
+snap_state() {
+  local v
+  v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "${v}" in
+    1|true|yes|on) printf 'yes' ;;
+    0|false|no|off) printf 'no' ;;
+    *) printf 'unset' ;;
+  esac
+}
+
+acquire_lock() {
+  local lock tries now mtime
+  [[ "$LOCKED" -eq 1 ]] && return 0
+  [[ "$DRY" -eq 1 ]] && return 0
+  lock="${CONF_DIR}/.sanoid-config.lock"
+  mkdir -p "${CONF_DIR}"
+  tries=0
+  while ! mkdir "${lock}" 2>/dev/null; do
+    if [[ -d "${lock}" ]]; then
+      now=$(date +%s)
+      mtime=$(file_mtime "${lock}")
+      if (( now - mtime > 120 )); then
+        rmdir "${lock}" 2>/dev/null || true
+        continue
+      fi
+    fi
+    tries=$((tries + 1))
+    if (( tries > 100 )); then
+      die "Timed out waiting for ${lock}"
+    fi
+    sleep 0.1
+  done
+  LOCK_DIR=${lock}
+  LOCKED=1
+}
+
+prepare_conf_dir() {
+  local write=0
+  case "${COMMAND}" in
+    set|unset|ignore|unignore|enable|disable) write=1 ;;
+    sync) [[ "$DRY" -eq 0 ]] && write=1 ;;
+    template)
+      if [[ "${ARGS[0]:-show}" == "set" && "$DRY" -eq 0 ]]; then
+        write=1
+      fi
+      ;;
+  esac
+  if [[ "$write" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ -d "${CONF_DIR}" && ( -w "${CONF_DIR}" || "$(id -u)" -eq 0 ) ]]; then
+    return 0
+  fi
+  if [[ ! -d "${CONF_DIR}" ]] && mkdir -p "${CONF_DIR}" 2>/dev/null; then
+    return 0
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    mkdir -p "${CONF_DIR}"
+    return 0
+  fi
+  command -v sudo >/dev/null 2>&1 || die "Run as root (cannot write ${CONF_DIR})."
+  exec sudo -E -- "$0" "${ORIG_ARGS[@]}"
+}
+
+require_template() {
+  [[ -f "${TEMPLATE}" ]] || die "Missing ${TEMPLATE}. install-sanoid-rhel.sh copies the orcd-sanoid sanoid.conf there."
+}
+
+require_defaults() {
+  [[ -f "${DEFAULTS}" ]] || die "Missing ${DEFAULTS}."
+}
+
+load_discover() {
+  local line key val p
+  DEFAULT_TEMPLATE="production"
+  DEPTH="all"
+  REQUIRE_AUTO_SNAPSHOT="yes"
+  unset POOLS EXCLUDES
+  declare -ga POOLS=()
+  declare -ga EXCLUDES=()
+  [[ -f "${DISCOVER}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line=${line%%#*}
+    line=$(trim "${line}")
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" == *=* ]] || die "Expected key=value in ${DISCOVER}: ${line}"
+    key=$(trim "${line%%=*}")
+    val=$(trim "${line#*=}")
+    case "${key}" in
+      default_template)
+        [[ "${val}" =~ ^[A-Za-z0-9_]+$ ]] || die "default_template must be a template name, got '${val}'."
+        DEFAULT_TEMPLATE=${val}
+        ;;
+      depth)
+        case "${val}" in
+          all|children) DEPTH=${val} ;;
+          *) die "depth must be 'all' or 'children', got '${val}'." ;;
+        esac
+        ;;
+      require_auto_snapshot)
+        case "${val}" in
+          yes|no) REQUIRE_AUTO_SNAPSHOT=${val} ;;
+          *) die "require_auto_snapshot must be yes or no, got '${val}'." ;;
+        esac
+        ;;
+      pools)
+        val=${val//,/ }
+        # shellcheck disable=SC2086
+        for p in ${val}; do
+          name_ok "${p}" || die "Invalid pool name in ${DISCOVER}: ${p}"
+          POOLS+=("${p}")
+        done
+        ;;
+      exclude)
+        [[ -n "${val}" ]] || die "exclude in ${DISCOVER} needs a pattern."
+        EXCLUDES+=("${val}")
+        ;;
+      *)
+        die "Unknown setting '${key}' in ${DISCOVER}."
+        ;;
+    esac
+  done < "${DISCOVER}"
+}
+
+load_template_names() {
+  local line
+  unset TEMPLATE_HAS
+  declare -gA TEMPLATE_HAS=()
+  require_template
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*\[template_([A-Za-z0-9_]+)\][[:space:]]*$ ]]; then
+      TEMPLATE_HAS["${BASH_REMATCH[1]}"]=1
+    fi
+  done < "${TEMPLATE}"
+  [[ -v TEMPLATE_HAS[${DEFAULT_TEMPLATE}] ]] || die "No [template_${DEFAULT_TEMPLATE}] section in ${TEMPLATE}."
+}
+
+load_allowed() {
+  local line in=0 key
+  unset ALLOWED
+  declare -gA ALLOWED=()
+  require_defaults
+  in=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]*$ ]]; then
+      if [[ "$(trim "${BASH_REMATCH[1]}")" == "template_default" ]]; then
+        in=1
+      else
+        in=0
+      fi
+      continue
+    fi
+    [[ "${in}" -eq 1 ]] || continue
+    if [[ "${line}" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*= ]]; then
+      key=${BASH_REMATCH[1]}
+      ALLOWED["${key}"]=1
+    fi
+  done < "${DEFAULTS}"
+  [[ "${#ALLOWED[@]}" -gt 0 ]] || die "No settings found under [template_default] in ${DEFAULTS}."
+}
+
+reset_overrides() {
+  unset OV_VAL OV_KEYS OV_DATASETS
+  declare -gA OV_VAL=()
+  declare -gA OV_KEYS=()
+  declare -ga OV_DATASETS=()
+}
+
+ov_remember() {
+  local ds=$1 existing
+  for existing in "${OV_DATASETS[@]+"${OV_DATASETS[@]}"}"; do
+    [[ "${existing}" == "${ds}" ]] && return 0
+  done
+  OV_DATASETS+=("${ds}")
+}
+
+ov_get() {
+  local k="$1|$2"
+  if [[ -v "OV_VAL[${k}]" ]]; then
+    printf '%s' "${OV_VAL[${k}]}"
+  fi
+}
+
+ov_set() {
+  local ds=$1 key=$2 val=$3
+  local line found=0 new=""
+  found=0
+  new=""
+  if [[ -v "OV_KEYS[${ds}]" ]]; then
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      [[ "${line}" == "${key}" ]] && found=1
+      new+="${line}"$'\n'
+    done <<< "${OV_KEYS[${ds}]}"
+  fi
+  if [[ "${found}" -eq 0 ]]; then
+    new+="${key}"$'\n'
+    ov_remember "${ds}"
+  fi
+  OV_KEYS["${ds}"]=${new}
+  OV_VAL["${ds}|${key}"]=${val}
+}
+
+ov_has_keys() {
+  [[ -n "${OV_KEYS[$1]:-}" ]]
+}
+
+ov_clear() {
+  local ds=$1 key
+  ov_has_keys "${ds}" || return 1
+  while IFS= read -r key; do
+    [[ -z "${key}" ]] && continue
+    unset "OV_VAL[${ds}|${key}]"
+  done <<< "${OV_KEYS[${ds}]}"
+  unset "OV_KEYS[${ds}]"
+}
+
+ov_unset_key() {
+  local ds=$1 key=$2 line new=""
+  [[ -v "OV_VAL[${ds}|${key}]" ]] || return 1
+  new=""
+  while IFS= read -r line; do
+    [[ -z "${line}" || "${line}" == "${key}" ]] && continue
+    new+="${line}"$'\n'
+  done <<< "${OV_KEYS[${ds}]-}"
+  if [[ -z "${new}" ]]; then
+    unset "OV_KEYS[${ds}]"
+  else
+    OV_KEYS["${ds}"]=${new}
+  fi
+  unset "OV_VAL[${ds}|${key}]"
+}
+
+ov_ignored() {
+  local v
+  v=$(ov_get "$1" ignore)
+  [[ -n "${v}" ]] && is_yes "${v}"
+}
+
+load_overrides() {
+  local line section="" key val
+  reset_overrides
+  [[ -f "${OVERRIDES}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" =~ ^[[:space:]]*$ ]] && continue
+    [[ "${line}" =~ ^[[:space:]]*[#\;] ]] && continue
+    if [[ "${line}" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]*$ ]]; then
+      section=$(trim "${BASH_REMATCH[1]}")
+      if [[ "${section}" == template_* ]]; then
+        die "Template sections belong in ${TEMPLATE}, not ${OVERRIDES} ([${section}])."
+      fi
+      dataset_name_ok "${section}" || die "Invalid dataset [${section}] in ${OVERRIDES}."
+      continue
+    fi
+    [[ -n "${section}" ]] || die "Setting before any dataset section in ${OVERRIDES}: ${line}"
+    if [[ "${line}" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      key=${BASH_REMATCH[1]}
+      val=$(trim "${BASH_REMATCH[2]}")
+      ov_set "${section}" "${key}" "${val}"
+    else
+      die "Cannot parse line in ${OVERRIDES}: ${line}"
+    fi
+  done < "${OVERRIDES}"
+}
+
+key_expects_int() {
+  case "$1" in
+    frequently|hourly|daily|weekly|monthly|yearly|frequent_period|prune_defer|script_timeout|capacity_warn|capacity_crit|*_min|*_hour|*_mday|*_wday|*_mon)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+key_expects_toggle() {
+  case "$1" in
+    autosnap|autoprune|monitor|monitor_dont_warn|monitor_dont_crit|recursive|process_children_only|skip_children|no_inconsistent_snapshot|force_post_snapshot_script)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_toggle() {
+  local v
+  v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "${v}" in
+    1|true|yes|on) printf 'yes' ;;
+    0|false|no|off) printf 'no' ;;
+    *) return 1 ;;
+  esac
+}
+
+templates_exist() {
+  local raw=$1 part
+  local -a parts=()
+  IFS=',' read -ra parts <<< "${raw}"
+  [[ "${#parts[@]}" -gt 0 ]] || die "use_template is empty."
+  for part in "${parts[@]}"; do
+    part=$(trim "${part}")
+    [[ "${part}" =~ ^[A-Za-z0-9_]+$ ]] || die "Template name '${part}' is not valid."
+    [[ -v "TEMPLATE_HAS[${part}]" ]] || die "No [template_${part}] section in ${TEMPLATE}."
+  done
+}
+
+validate_key_value() {
+  local key=$1 val=$2
+  [[ "${key}" =~ ^[A-Za-z0-9_]+$ ]] || die "Invalid setting name '${key}'."
+  [[ -n "${val}" ]] || die "Setting ${key} needs a value."
+  [[ "${val}" != *$'\n'* ]] || die "Setting ${key} cannot contain a newline."
+  if [[ "${key}" == "ignore" ]]; then
+    die "Use 'sanoid-config ignore DATASET' to skip a dataset."
+  fi
+  [[ -v "ALLOWED[${key}]" ]] || die "Sanoid does not have a setting named '${key}'."
+  if [[ "${key}" == "use_template" ]]; then
+    templates_exist "${val}"
+    printf '%s' "${val}"
+    return 0
+  fi
+  if key_expects_int "${key}"; then
+    [[ "${val}" =~ ^[0-9]+$ ]] || die "${key} must be a non-negative integer, got '${val}'."
+    printf '%s' "${val}"
+    return 0
+  fi
+  if key_expects_toggle "${key}"; then
+    normalize_toggle "${val}" || die "${key} must be yes or no, got '${val}'."
+    return 0
+  fi
+  printf '%s' "${val}"
+}
+
+validate_loaded_overrides() {
+  local ds key val normalized
+  for ds in "${OV_DATASETS[@]+"${OV_DATASETS[@]}"}"; do
+    dataset_name_ok "${ds}" || die "Invalid dataset in ${OVERRIDES}: ${ds}"
+    ov_has_keys "${ds}" || continue
+    while IFS= read -r key; do
+      [[ -z "${key}" ]] && continue
+      val="${OV_VAL[${ds}|${key}]}"
+      if [[ "${key}" == "ignore" ]]; then
+        is_yes "${val}" || die "ignore for ${ds} must be yes."
+        continue
+      fi
+      normalized=$(validate_key_value "${key}" "${val}")
+      OV_VAL["${ds}|${key}"]=${normalized}
+    done <<< "${OV_KEYS[${ds}]}"
+  done
+}
+
+zfs_bin() {
+  if [[ -n "${SANOID_ZFS:-}" ]]; then
+    printf '%s' "${SANOID_ZFS}"
+  else
+    printf '%s' "zfs"
+  fi
+}
+
+load_zfs() {
+  local src line name type rest prop snap zcmd
+  unset FOUND_NAMES FOUND_SET FOUND_TYPE FOUND_SNAP
+  declare -ga FOUND_NAMES=()
+  declare -gA FOUND_SET=()
+  declare -gA FOUND_TYPE=()
+  declare -gA FOUND_SNAP=()
+  if [[ -n "${FROM_LIST}" ]]; then
+    [[ -f "${FROM_LIST}" ]] || die "List file not found: ${FROM_LIST}. ${CONF} was not changed."
+    src=${FROM_LIST}
+  else
+    zcmd=$(zfs_bin)
+    if [[ -n "${SANOID_ZFS:-}" ]]; then
+      [[ -x "${SANOID_ZFS}" ]] || die "SANOID_ZFS is not executable: ${SANOID_ZFS}"
+    elif ! command -v zfs >/dev/null 2>&1; then
+      die "zfs was not found. ${CONF} was not changed."
+    fi
+    TMP_LIST=$(mktemp)
+    src=${TMP_LIST}
+    if ! "${zcmd}" list -H -o name,type,com.sun:auto-snapshot -t filesystem,volume > "${src}"; then
+      die "zfs list failed. ${CONF} was not changed."
+    fi
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line=${line%%#*}
+    line=$(trim "${line}")
+    [[ -z "${line}" ]] && continue
+    name=${line%%[[:space:]]*}
+    rest=${line#"${name}"}
+    rest=$(trim "${rest}")
+    type=${rest%%[[:space:]]*}
+    [[ "${name}" == "NAME" || "${name}" == "name" ]] && continue
+    [[ "${name}" == *@* ]] && continue
+    name_ok "${name}" || continue
+    prop=""
+    case "${type}" in
+      filesystem|volume)
+        prop=${rest#"${type}"}
+        prop=$(trim "${prop}")
+        prop=${prop%%[[:space:]]*}
+        ;;
+      snapshot|bookmark) continue ;;
+      *) type="filesystem" ;;
+    esac
+    snap=$(snap_state "${prop}")
+    [[ -v "FOUND_SET[${name}]" ]] && continue
+    FOUND_SET["${name}"]=1
+    FOUND_TYPE["${name}"]=${type}
+    FOUND_SNAP["${name}"]=${snap}
+    FOUND_NAMES+=("${name}")
+  done < "${src}"
+  if [[ "${#FOUND_NAMES[@]}" -gt 0 ]]; then
+    mapfile -t FOUND_NAMES < <(printf '%s\n' "${FOUND_NAMES[@]}" | LC_ALL=C sort -u)
+  fi
+  if [[ -n "${TMP_LIST}" ]]; then
+    rm -f "${TMP_LIST}"
+    TMP_LIST=""
+  fi
+}
+
+pool_allowed() {
+  local pool=$1 p
+  [[ "${#POOLS[@]}" -eq 0 ]] && return 0
+  for p in "${POOLS[@]}"; do
+    [[ "${p}" == "${pool}" ]] && return 0
+  done
+  return 1
+}
+
+excluded_by_glob() {
+  local name=$1 pat
+  for pat in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
+    # Unquoted pattern so the discover.conf glob is applied.
+    # shellcheck disable=SC2254
+    [[ "${name}" == ${pat} ]] && return 0
+  done
+  return 1
+}
+
+classify() {
+  local name=$1 pool slashes
+  if [[ "${name}" != */* ]]; then
+    printf 'pool'
+    return 0
+  fi
+  if [[ "${REQUIRE_AUTO_SNAPSHOT}" != "no" && "${FOUND_SNAP[${name}]:-unset}" == "no" ]]; then
+    printf 'skipped com.sun:auto-snapshot is false'
+    return 0
+  fi
+  pool=${name%%/*}
+  if ! pool_allowed "${pool}"; then
+    printf 'skipped pool %s is not in pools=' "${pool}"
+    return 0
+  fi
+  if excluded_by_glob "${name}"; then
+    printf 'skipped exclude pattern'
+    return 0
+  fi
+  slashes=${name//[^\/]/}
+  if [[ "${DEPTH}" == "children" && "${#slashes}" -ne 1 ]]; then
+    printf 'skipped nested dataset (depth=children)'
+    return 0
+  fi
+  if ov_ignored "${name}"; then
+    printf 'ignored'
+    return 0
+  fi
+  printf 'active'
+}
+
+active_datasets() {
+  local name state
+  for name in "${FOUND_NAMES[@]+"${FOUND_NAMES[@]}"}"; do
+    state=$(classify "${name}")
+    [[ "${state}" == "active" ]] && printf '%s\n' "${name}"
+  done
+}
+
+render_dataset_section() {
+  local ds=$1 tmpl key
+  tmpl=$(ov_get "${ds}" use_template)
+  [[ -n "${tmpl}" ]] || tmpl=${DEFAULT_TEMPLATE}
+  printf '[%s]\n' "${ds}"
+  printf '\tuse_template = %s\n' "${tmpl}"
+  if ov_has_keys "${ds}"; then
+    while IFS= read -r key; do
+      [[ -z "${key}" || "${key}" == "use_template" || "${key}" == "ignore" ]] && continue
+      printf '\t%s = %s\n' "${key}" "${OV_VAL[${ds}|${key}]}"
+    done <<< "${OV_KEYS[${ds}]}"
+  fi
+}
+
+check_active_templates() {
+  local ds tmpl
+  while IFS= read -r ds; do
+    [[ -z "${ds}" ]] && continue
+    tmpl=$(ov_get "${ds}" use_template)
+    [[ -n "${tmpl}" ]] || tmpl=${DEFAULT_TEMPLATE}
+    templates_exist "${tmpl}"
+  done < <(active_datasets)
+}
+
+conf_is_replaceable() {
+  local line name any=0 only_sample=1 saw_section=0
+  [[ "${FORCE}" -eq 1 ]] && return 0
+  [[ ! -e "${CONF}" || ! -s "${CONF}" ]] && return 0
+  if grep -qx '# SANOID-CONFIG-MANAGED' "${CONF}"; then
+    return 0
+  fi
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" =~ ^[[:space:]]*$ ]] && continue
+    [[ "${line}" =~ ^[[:space:]]*[#\;] ]] && continue
+    if [[ "${line}" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]*$ ]]; then
+      saw_section=1
+      name=$(trim "${BASH_REMATCH[1]}")
+      [[ "${name}" == template_* ]] && continue
+      any=1
+      [[ "${name}" == "data1/test" ]] || only_sample=0
+    fi
+  done < "${CONF}"
+  if [[ "${any}" -eq 0 ]]; then
+    # Comments only, or templates with no dataset placeholder.
+    [[ "${saw_section}" -eq 0 ]]
+    return
+  fi
+  [[ "${only_sample}" -eq 1 ]]
+}
+
+old_dataset_names() {
+  local line name
+  [[ -f "${CONF}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*\[([^]]+)\][[:space:]]*$ ]]; then
+      name=$(trim "${BASH_REMATCH[1]}")
+      [[ "${name}" == template_* ]] && continue
+      printf '%s\n' "${name}"
+    fi
+  done < "${CONF}"
+}
+
+write_overrides() {
+  local tmp ds key
+  local -a ordered=()
+  tmp=$(mktemp "${CONF_DIR}/sanoid-overrides.conf.tmp.XXXXXX")
+  {
+    cat <<'EOF'
+# Per-dataset overrides for sanoid-config.
+# Rewritten by: sanoid-config set, unset, ignore, unignore.
+# ignore = yes keeps the dataset out of sanoid.conf.
+# Other keys are copied onto that dataset and override the template.
+
+EOF
+    if [[ "${#OV_DATASETS[@]}" -gt 0 ]]; then
+      mapfile -t ordered < <(printf '%s\n' "${OV_DATASETS[@]}" | LC_ALL=C sort -u)
+    fi
+    for ds in "${ordered[@]+"${ordered[@]}"}"; do
+      ov_has_keys "${ds}" || continue
+      printf '[%s]\n' "${ds}"
+      while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+        printf '\t%s = %s\n' "${key}" "${OV_VAL[${ds}|${key}]}"
+      done <<< "${OV_KEYS[${ds}]}"
+      printf '\n'
+    done
+  } > "${tmp}"
+  chmod 0644 "${tmp}"
+  mv -f "${tmp}" "${OVERRIDES}"
+}
+
+cmd_sync() {
+  local reload=${1:-1}
+  local count=0 ds last
+  local -a active=()
+  if [[ "${reload}" -eq 1 ]]; then
+    load_discover
+    load_overrides
+    load_template_names
+    load_allowed
+    validate_loaded_overrides
+  fi
+  load_zfs
+  check_active_templates
+  if ! conf_is_replaceable; then
+    refuse "${CONF} was not written by sanoid-config, so it was left unchanged. Replace it with: sanoid-config sync --force"
+  fi
+  while IFS= read -r ds; do
+    [[ -z "${ds}" ]] && continue
+    active+=("${ds}")
+  done < <(active_datasets)
+  count=${#active[@]}
+  enable_unset_datasets "${active[@]+"${active[@]}"}"
+  mkdir -p "${CONF_DIR}"
+  if [[ -n "${TMP_RENDER}" ]]; then
+    rm -f "${TMP_RENDER}"
+  fi
+  TMP_RENDER=$(mktemp "${CONF_DIR}/sanoid.conf.tmp.XXXXXX")
+  {
+    cat <<EOF
+# SANOID-CONFIG-MANAGED
+# Written by sanoid-config. Dataset sections are replaced on each sync.
+# Uniform retention is [template_${DEFAULT_TEMPLATE}] in ${TEMPLATE}.
+#   sanoid-config template set hourly=3 daily=1 monthly=0
+# A new dataset is added here and com.sun:auto-snapshot is set to true.
+#   sanoid-config disable data1/edboyden
+#   sanoid-config set data1/edboyden hourly=6 daily=7
+#   sanoid-config ignore data1/scratch
+# Placeholder datasets such as data1/test are not copied into this file.
+
+EOF
+    for ds in "${active[@]+"${active[@]}"}"; do
+      render_dataset_section "${ds}"
+      printf '\n'
+    done
+    cat "${TEMPLATE}"
+    if [[ -s "${TEMPLATE}" ]]; then
+      # Keep a single trailing newline when the template already ends with one.
+      :
+    fi
+  } > "${TMP_RENDER}"
+  # Repeated syncs must byte-compare equal, so the file always ends in one newline.
+  # od is used because command substitution would strip that newline.
+  if [[ -s "${TMP_RENDER}" ]]; then
+    last=$(tail -c 1 "${TMP_RENDER}" | od -An -tu1 | tr -d '[:space:]')
+    [[ "${last}" == "10" ]] || printf '\n' >> "${TMP_RENDER}"
+  fi
+  chmod 0644 "${TMP_RENDER}"
+
+  if [[ -f "${CONF}" ]] && cmp -s "${CONF}" "${TMP_RENDER}"; then
+    if [[ "${DRY}" -eq 1 ]]; then
+      cat "${TMP_RENDER}"
+    fi
+    if [[ "${QUIET}" -eq 0 ]]; then
+      info "up to date: ${CONF} (${count} datasets)"
+    fi
+    rm -f "${TMP_RENDER}"
+    TMP_RENDER=""
+    return 0
+  fi
+
+  local old_file new_file added removed
+  old_file=$(mktemp)
+  new_file=$(mktemp)
+  old_dataset_names | LC_ALL=C sort -u > "${old_file}"
+  if [[ "${#active[@]}" -eq 0 ]]; then
+    : > "${new_file}"
+  else
+    printf '%s\n' "${active[@]}" | LC_ALL=C sort -u > "${new_file}"
+  fi
+  added=$(comm -13 "${old_file}" "${new_file}" || true)
+  removed=$(comm -23 "${old_file}" "${new_file}" || true)
+  rm -f "${old_file}" "${new_file}"
+
+  if [[ "${DRY}" -eq 1 ]]; then
+    cat "${TMP_RENDER}"
+    rm -f "${TMP_RENDER}"
+    TMP_RENDER=""
+    [[ -n "${added}" ]] && info "would add:"$'\n'"${added}"
+    [[ -n "${removed}" ]] && info "would remove:"$'\n'"${removed}"
+    info "would write ${CONF} (${count} datasets)"
+    return 0
+  fi
+
+  acquire_lock
+  mv -f "${TMP_RENDER}" "${CONF}"
+  TMP_RENDER=""
+  [[ -n "${added}" ]] && info "added:"$'\n'"${added}"
+  [[ -n "${removed}" ]] && info "removed:"$'\n'"${removed}"
+  if [[ -z "${added}" && -z "${removed}" ]]; then
+    info "updated settings in ${CONF} (${count} datasets)"
+  else
+    info "wrote ${CONF} (${count} datasets)"
+  fi
+}
+
+cmd_list() {
+  local name state detail tmpl key extra
+  local -a absent=()
+  load_discover
+  load_overrides
+  load_template_names
+  load_zfs
+  printf '%-10s %s\n' "STATE" "DATASET"
+  for name in "${FOUND_NAMES[@]+"${FOUND_NAMES[@]}"}"; do
+    state=$(classify "${name}")
+    detail=""
+    case "${state}" in
+      active|ignored)
+        tmpl=$(ov_get "${name}" use_template)
+        [[ -n "${tmpl}" ]] || tmpl=${DEFAULT_TEMPLATE}
+        detail="template=${tmpl}"
+        if ov_has_keys "${name}"; then
+          extra=""
+          while IFS= read -r key; do
+            [[ -z "${key}" || "${key}" == "use_template" || "${key}" == "ignore" ]] && continue
+            extra+=" ${key}=${OV_VAL[${name}|${key}]}"
+          done <<< "${OV_KEYS[${name}]}"
+          detail+="${extra}"
+        fi
+        ;;
+      pool)
+        detail="pool root, not snapshotted"
+        state="pool"
+        ;;
+      skipped*)
+        detail=${state#skipped }
+        state="skipped"
+        ;;
+    esac
+    printf '%-10s %s' "${state}" "${name}"
+    [[ -n "${detail}" ]] && printf '  %s' "${detail}"
+    printf '\n'
+  done
+  for name in "${OV_DATASETS[@]+"${OV_DATASETS[@]}"}"; do
+    [[ -v "FOUND_SET[${name}]" ]] && continue
+    ov_has_keys "${name}" || continue
+    absent+=("${name}")
+  done
+  if [[ "${#absent[@]}" -gt 0 ]]; then
+    printf '\nOverrides for datasets that are not in the ZFS list:\n'
+    for name in "${absent[@]}"; do
+      extra=""
+      while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+        extra+=" ${key}=${OV_VAL[${name}|${key}]}"
+      done <<< "${OV_KEYS[${name}]}"
+      printf '%-10s %s %s\n' "absent" "${name}" "${extra# }"
+    done
+  fi
+}
+
+cmd_show() {
+  local ds state
+  [[ "${#ARGS[@]}" -eq 1 ]] || die "Usage: sanoid-config show DATASET"
+  ds=${ARGS[0]}
+  dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name. Pool roots are not snapshotted."
+  load_discover
+  load_overrides
+  load_template_names
+  load_zfs
+  if [[ ! -v "FOUND_SET[${ds}]" ]]; then
+    if ov_has_keys "${ds}"; then
+      printf '%s is not in the ZFS list. Saved overrides:\n' "${ds}"
+      render_dataset_section "${ds}"
+      return 0
+    fi
+    die "No dataset named ${ds} in the ZFS list."
+  fi
+  state=$(classify "${ds}")
+  case "${state}" in
+    active)
+      render_dataset_section "${ds}"
+      ;;
+    ignored)
+      printf '%s is ignored.\n' "${ds}"
+      printf 'Restore it with: sanoid-config unignore %s\n' "${ds}"
+      ;;
+    pool)
+      printf '%s is a pool root and is not added to sanoid.conf.\n' "${ds}"
+      ;;
+    skipped*)
+      printf '%s is not configured (%s).\n' "${ds}" "${state#skipped }"
+      ;;
+    *)
+      die "No dataset named ${ds}."
+      ;;
+  esac
+}
+
+apply_assignments() {
+  local ds=$1 shift_count=$2
+  local arg key val normalized
+  local -a rest=()
+  rest=("${ARGS[@]:${shift_count}}")
+  [[ "${#rest[@]}" -gt 0 ]] || die "Usage: sanoid-config set DATASET KEY=VALUE ..."
+  dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name. Pool roots are not configured."
+  for arg in "${rest[@]}"; do
+    [[ "${arg}" == *=* ]] || die "Expected KEY=VALUE, got '${arg}'."
+    key=${arg%%=*}
+    val=${arg#*=}
+    key=$(trim "${key}")
+    val=$(trim "${val}")
+    normalized=$(validate_key_value "${key}" "${val}")
+    ov_set "${ds}" "${key}" "${normalized}"
+  done
+}
+
+cmd_set() {
+  [[ "${#ARGS[@]}" -ge 2 ]] || die "Usage: sanoid-config set DATASET KEY=VALUE ..."
+  load_discover
+  load_overrides
+  load_template_names
+  load_allowed
+  validate_loaded_overrides
+  apply_assignments "${ARGS[0]}" 1
+  if [[ "${DRY}" -eq 0 ]]; then
+    acquire_lock
+    write_overrides
+    info "saved overrides for ${ARGS[0]} in ${OVERRIDES}"
+  fi
+  cmd_sync 0
+}
+
+cmd_unset() {
+  local ds key
+  [[ "${#ARGS[@]}" -ge 1 ]] || die "Usage: sanoid-config unset DATASET [KEY ...]"
+  ds=${ARGS[0]}
+  dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name."
+  load_discover
+  load_overrides
+  load_template_names
+  load_allowed
+  if [[ "${#ARGS[@]}" -eq 1 ]]; then
+    ov_clear "${ds}" || die "No overrides are stored for ${ds}."
+  else
+    for key in "${ARGS[@]:1}"; do
+      ov_unset_key "${ds}" "${key}" || die "No override ${key} on ${ds}."
+    done
+  fi
+  if [[ "${DRY}" -eq 0 ]]; then
+    acquire_lock
+    write_overrides
+    info "updated overrides for ${ds}"
+  fi
+  validate_loaded_overrides
+  cmd_sync 0
+}
+
+cmd_ignore() {
+  local ds
+  [[ "${#ARGS[@]}" -ge 1 ]] || die "Usage: sanoid-config ignore DATASET ..."
+  load_discover
+  load_overrides
+  load_template_names
+  load_allowed
+  validate_loaded_overrides
+  for ds in "${ARGS[@]}"; do
+    dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name."
+    ov_set "${ds}" ignore yes
+  done
+  if [[ "${DRY}" -eq 0 ]]; then
+    acquire_lock
+    write_overrides
+    info "ignored: ${ARGS[*]}"
+  fi
+  cmd_sync 0
+}
+
+cmd_unignore() {
+  local ds
+  [[ "${#ARGS[@]}" -ge 1 ]] || die "Usage: sanoid-config unignore DATASET ..."
+  load_discover
+  load_overrides
+  load_template_names
+  load_allowed
+  for ds in "${ARGS[@]}"; do
+    dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name."
+    ov_unset_key "${ds}" ignore || die "${ds} is not ignored."
+  done
+  validate_loaded_overrides
+  if [[ "${DRY}" -eq 0 ]]; then
+    acquire_lock
+    write_overrides
+    info "unignored: ${ARGS[*]}"
+  fi
+  cmd_sync 0
+}
+
+print_template_section() {
+  local line in=0
+  in=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${line}" =~ ^[[:space:]]*\[template_"${DEFAULT_TEMPLATE}"\][[:space:]]*$ ]]; then
+      in=1
+      printf '%s\n' "${line}"
+      continue
+    fi
+    if [[ "${in}" -eq 1 && "${line}" =~ ^[[:space:]]*\[ ]]; then
+      break
+    fi
+    if [[ "${in}" -eq 1 ]]; then
+      printf '%s\n' "${line}"
+    fi
+  done < "${TEMPLATE}"
+}
+
+append_new_template_keys() {
+  local -n dest=$1
+  local key
+  for key in "${SET_ORDER[@]}"; do
+    [[ -v "DONE[${key}]" ]] && continue
+    dest+=($'\t'"${key} = ${NEWVAL[${key}]}")
+    DONE["${key}"]=1
+  done
+}
+
+rewrite_template_to() {
+  local dest=$1
+  local -a lines=() out=()
+  local i start=-1 end line key
+  mapfile -t lines < "${TEMPLATE}"
+  end=${#lines[@]}
+  for i in "${!lines[@]}"; do
+    if [[ "${lines[$i]}" =~ ^[[:space:]]*\[template_"${DEFAULT_TEMPLATE}"\][[:space:]]*$ ]]; then
+      start=$i
+      continue
+    fi
+    if [[ "${start}" -ge 0 && "${i}" -gt "${start}" && "${lines[$i]}" =~ ^[[:space:]]*\[ ]]; then
+      end=$i
+      break
+    fi
+  done
+  [[ "${start}" -ge 0 ]] || die "No [template_${DEFAULT_TEMPLATE}] section in ${TEMPLATE}."
+  unset DONE
+  declare -A DONE=()
+  for i in "${!lines[@]}"; do
+    line=${lines[$i]}
+    if [[ "${i}" -eq "${end}" ]]; then
+      append_new_template_keys out
+    fi
+    if [[ "${i}" -gt "${start}" && "${i}" -lt "${end}" && "${line}" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*= ]]; then
+      key=${BASH_REMATCH[1]}
+      if [[ -v "NEWVAL[${key}]" ]]; then
+        out+=($'\t'"${key} = ${NEWVAL[${key}]}")
+        DONE["${key}"]=1
+        continue
+      fi
+    fi
+    out+=("${line}")
+  done
+  if [[ "${end}" -eq "${#lines[@]}" ]]; then
+    append_new_template_keys out
+  fi
+  printf '%s\n' "${out[@]}" > "${dest}"
+}
+
+cmd_template_show() {
+  [[ "${#ARGS[@]}" -le 1 ]] || die "Usage: sanoid-config template show"
+  load_discover
+  load_template_names
+  printf '# %s [template_%s]\n' "${TEMPLATE}" "${DEFAULT_TEMPLATE}"
+  print_template_section
+}
+
+cmd_template_set() {
+  local arg key val normalized tmp
+  local -a kvs=()
+  kvs=("${ARGS[@]:1}")
+  [[ "${#kvs[@]}" -gt 0 ]] || die "Usage: sanoid-config template set KEY=VALUE ..."
+  load_discover
+  load_template_names
+  load_allowed
+  unset NEWVAL SET_ORDER
+  declare -gA NEWVAL=()
+  declare -ga SET_ORDER=()
+  for arg in "${kvs[@]}"; do
+    [[ "${arg}" == *=* ]] || die "Expected KEY=VALUE, got '${arg}'."
+    key=$(trim "${arg%%=*}")
+    val=$(trim "${arg#*=}")
+    case "${key}" in
+      use_template|recursive)
+        die "Sanoid does not take '${key}' from a template. Set it on a dataset: sanoid-config set DATASET ${key}=..."
+        ;;
+    esac
+    normalized=$(validate_key_value "${key}" "${val}")
+    if [[ ! -v "NEWVAL[${key}]" ]]; then
+      SET_ORDER+=("${key}")
+    fi
+    NEWVAL["${key}"]=${normalized}
+  done
+  tmp=$(mktemp "${CONF_DIR}/sanoid.conf.template.tmp.XXXXXX")
+  rewrite_template_to "${tmp}"
+  if [[ "${DRY}" -eq 1 ]]; then
+    TEMPLATE=${tmp}
+    cmd_sync 1
+    rm -f "${tmp}"
+    return 0
+  fi
+  acquire_lock
+  chmod 0644 "${tmp}"
+  mv -f "${tmp}" "${TEMPLATE}"
+  info "updated [template_${DEFAULT_TEMPLATE}] in ${TEMPLATE}"
+  info "A later install-sanoid-rhel.sh replaces that file from sanoid/sanoid.conf."
+  cmd_sync 1
+}
+
+# New datasets are configured and, on a live zfs list, marked true.
+# --from-list only rewrites sanoid.conf. An explicit false is not turned back on.
+enable_unset_datasets() {
+  local ds zcmd
+  [[ "${REQUIRE_AUTO_SNAPSHOT}" == "no" ]] && return 0
+  [[ -n "${FROM_LIST}" ]] && return 0
+  [[ "$#" -eq 0 ]] && return 0
+  zcmd=$(zfs_bin)
+  if [[ -z "${SANOID_ZFS:-}" ]] && ! command -v zfs >/dev/null 2>&1; then
+    die "zfs was not found. ${CONF} was not changed."
+  fi
+  for ds in "$@"; do
+    [[ "${FOUND_SNAP[${ds}]:-unset}" == "yes" ]] && continue
+    if [[ "${DRY}" -eq 1 ]]; then
+      info "would run: ${zcmd} set com.sun:auto-snapshot=true ${ds}"
+      continue
+    fi
+    "${zcmd}" set "com.sun:auto-snapshot=true" "${ds}" \
+      || die "zfs set com.sun:auto-snapshot=true failed for ${ds}. ${CONF} was not changed."
+    FOUND_SNAP["${ds}"]=yes
+    info "set com.sun:auto-snapshot=true on ${ds}"
+  done
+}
+
+cmd_snapshot_property() {
+  local value=$1 verb=$2
+  local ds zcmd
+  [[ "${#ARGS[@]}" -ge 1 ]] || die "Usage: sanoid-config ${verb} DATASET ..."
+  zcmd=$(zfs_bin)
+  if [[ -z "${SANOID_ZFS:-}" ]] && ! command -v zfs >/dev/null 2>&1; then
+    die "zfs was not found."
+  fi
+  for ds in "${ARGS[@]}"; do
+    dataset_name_ok "${ds}" || die "'${ds}' is not a dataset name. Pool roots are not configured."
+    if [[ "${DRY}" -eq 1 ]]; then
+      info "would run: ${zcmd} set com.sun:auto-snapshot=${value} ${ds}"
+      continue
+    fi
+    "${zcmd}" set "com.sun:auto-snapshot=${value}" "${ds}" \
+      || die "zfs set com.sun:auto-snapshot=${value} failed for ${ds}."
+    info "set com.sun:auto-snapshot=${value} on ${ds}"
+  done
+  [[ "${DRY}" -eq 1 ]] && return 0
+  cmd_sync
+}
+
+cmd_enable() {
+  cmd_snapshot_property true enable
+}
+
+cmd_disable() {
+  cmd_snapshot_property false disable
+}
+
+cmd_template() {
+  local sub=${ARGS[0]:-show}
+  case "${sub}" in
+    show) cmd_template_show ;;
+    set) cmd_template_set ;;
+    *) die "Usage: sanoid-config template show|set KEY=VALUE ..." ;;
+  esac
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --conf-dir)
+        [[ $# -ge 2 ]] || die "--conf-dir requires a directory"
+        CONF_DIR=$2
+        shift 2
+        ;;
+      --from-list)
+        [[ $# -ge 2 ]] || die "--from-list requires a file"
+        FROM_LIST=$2
+        shift 2
+        ;;
+      --dry-run)
+        DRY=1
+        shift
+        ;;
+      --force)
+        FORCE=1
+        shift
+        ;;
+      --quiet)
+        QUIET=1
+        shift
+        ;;
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        ARGS+=("$@")
+        break
+        ;;
+      -*)
+        die "Unknown option: $1 (try --help)"
+        ;;
+      *)
+        if [[ -z "${COMMAND}" ]]; then
+          COMMAND=$1
+        else
+          ARGS+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+}
+
+main() {
+  parse_args "$@"
+  [[ -n "${COMMAND}" ]] || { usage >&2; exit 1; }
+  case "${COMMAND}" in
+    sync|list|show|set|unset|ignore|unignore|enable|disable|template) ;;
+    *) die "Unknown command: ${COMMAND} (try --help)" ;;
+  esac
+  CONF_DIR=$(CDPATH= cd -- "${CONF_DIR}" 2>/dev/null && pwd || printf '%s' "${CONF_DIR}")
+  CONF="${CONF_DIR}/sanoid.conf"
+  TEMPLATE="${CONF_DIR}/sanoid.conf.template"
+  OVERRIDES="${CONF_DIR}/sanoid-overrides.conf"
+  DISCOVER="${CONF_DIR}/sanoid-discover.conf"
+  DEFAULTS="${CONF_DIR}/sanoid.defaults.conf"
+  prepare_conf_dir
+  case "${COMMAND}" in
+    sync) cmd_sync ;;
+    list) cmd_list ;;
+    show) cmd_show ;;
+    set) cmd_set ;;
+    unset) cmd_unset ;;
+    ignore) cmd_ignore ;;
+    unignore) cmd_unignore ;;
+    enable) cmd_enable ;;
+    disable) cmd_disable ;;
+    template) cmd_template ;;
+  esac
+}
+
+main "$@"
