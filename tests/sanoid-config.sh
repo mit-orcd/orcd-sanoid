@@ -255,7 +255,14 @@ grep -qx '\[data1/images\]' "${ETC}/sanoid.conf" && fail "removed volume stayed 
 grep -q '^\[data1/future\]' "${ETC}/sanoid-overrides.conf" || fail "override file dropped an absent dataset"
 printf 'ok removed datasets leave sanoid.conf\n'
 
+cp "${ETC}/sanoid.conf.template" "${WORK}/before-unnamed-template.conf"
 run template set hourly=4
+assert_rc 1
+printf '%s\n' "${ERR}" | grep -q 'production' || fail "unnamed template set did not ask for a name"
+cmp -s "${WORK}/before-unnamed-template.conf" "${ETC}/sanoid.conf.template" || fail "unnamed template set wrote the file"
+printf 'ok template set requires a template name\n'
+
+run template set production hourly=4
 assert_rc 0
 awk '
   $0 == "[template_production]" { inside = 1; next }
@@ -273,11 +280,34 @@ awk '
 grep -qx $'\thourly = 4' "${WORK}/prod-live" || fail "live template hourly"
 printf 'ok template set changes every dataset from one place\n'
 
-run template set notakey=1
+run template set backup hourly=12
+assert_rc 0
+awk '
+  $0 == "[template_backup]" { inside = 1; next }
+  inside && /^\[/ { exit }
+  inside { print }
+' "${ETC}/sanoid.conf.template" > "${WORK}/backup-file"
+grep -qx $'\thourly = 12' "${WORK}/backup-file" || fail "backup hourly was not changed"
+awk '
+  $0 == "[template_production]" { inside = 1; next }
+  inside && /^\[/ { exit }
+  inside { print }
+' "${ETC}/sanoid.conf.template" > "${WORK}/prod-file"
+grep -qx $'\thourly = 4' "${WORK}/prod-file" || fail "production hourly changed with backup"
+printf 'ok template set backup leaves production unchanged\n'
+
+cp "${ETC}/sanoid.conf.template" "${WORK}/before-missing-template.conf"
+run template set nosuch hourly=1
+assert_rc 1
+printf '%s\n' "${ERR}" | grep -q 'template_nosuch' || fail "missing template was not named"
+cmp -s "${WORK}/before-missing-template.conf" "${ETC}/sanoid.conf.template" || fail "missing template changed the file"
+printf 'ok template set does not create a template\n'
+
+run template set production notakey=1
 assert_rc 1
 printf 'ok template set rejects unknown keys\n'
 
-run template set recursive=yes
+run template set production recursive=yes
 assert_rc 1
 printf 'ok recursive is set on a dataset, not the template\n'
 

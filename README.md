@@ -97,44 +97,51 @@ autoprune = yes
 One day of snapshots, one every hour (24 snapshots):
 
 ```sh
-sanoid-config template set frequently=0 hourly=24 daily=0 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequently=0 hourly=24 daily=0 weekly=0 monthly=0 yearly=0
 ```
 
 One day of snapshots, one every 6 hours. Sanoid's intervals are 15 minutes, 1 hour, 1 day, 1 week, 1 month, and 1 year. Covering that day is either a snapshot every hour, or one snapshot for the day:
 
 ```sh
 # 24 snapshots, one each hour
-sanoid-config template set frequently=0 hourly=24 daily=0 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequently=0 hourly=24 daily=0 weekly=0 monthly=0 yearly=0
 
 # 1 snapshot, taken at 23:59 UTC
-sanoid-config template set frequently=0 hourly=0 daily=1 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequently=0 hourly=0 daily=1 weekly=0 monthly=0 yearly=0
 ```
 
 Two weekly snapshots. Sanoid takes one each Monday at 23:30 UTC and keeps the last two, so the history covers two weeks:
 
 ```sh
-sanoid-config template set frequently=0 hourly=0 daily=0 weekly=2 monthly=0 yearly=0
+sanoid-config template set production frequently=0 hourly=0 daily=0 weekly=2 monthly=0 yearly=0
 ```
 
 Two days, one snapshot a day:
 
 ```sh
-sanoid-config template set frequently=0 hourly=0 daily=2 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequently=0 hourly=0 daily=2 weekly=0 monthly=0 yearly=0
 ```
 
 One day of snapshots every 30 minutes (48 snapshots):
 
 ```sh
-sanoid-config template set frequent_period=30 frequently=48 hourly=0 daily=0 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequent_period=30 frequently=48 hourly=0 daily=0 weekly=0 monthly=0 yearly=0
 ```
 
 Six hours of snapshots every 15 minutes (`frequently = 24`, and `frequent_period` left at 15):
 
 ```sh
-sanoid-config template set frequently=24 hourly=0 daily=0 weekly=0 monthly=0 yearly=0
+sanoid-config template set production frequently=24 hourly=0 daily=0 weekly=0 monthly=0 yearly=0
 ```
 
-`sanoid-config template set` updates every dataset that uses the production template. A later run of `install-sanoid-rhel.sh` copies `sanoid.conf` over `/etc/sanoid/sanoid.conf.template`. Edit the copy in this repository when the new counts should survive a reinstall.
+The word after `template set` is the template's short name. `production` updates `[template_production]` and the datasets that use it. Datasets on another template stay as they are until that name is used:
+
+```sh
+sanoid-config template show backup
+sanoid-config template set backup hourly=30 daily=90
+```
+
+`backup` is the `[template_backup]` section. A name that is not already in the file is rejected, and no new template is created. A later run of `install-sanoid-rhel.sh` copies `sanoid.conf` over `/etc/sanoid/sanoid.conf.template`. Edit the copy in this repository when the new counts should survive a reinstall.
 
 Override one dataset:
 

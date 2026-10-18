@@ -19,7 +19,8 @@
 #   sanoid-config enable data1/orcd
 #   sanoid-config set data1/edboyden hourly=6 daily=7
 #   sanoid-config ignore data1/scratch
-#   sanoid-config template set hourly=4
+#   sanoid-config template set production hourly=4
+#   sanoid-config template set backup hourly=30
 #
 # sanoid-discover.service runs "sanoid-config sync" on a timer. The same
 # command is what an operator runs by hand.
@@ -62,9 +63,10 @@ Commands:
                          Remove overrides. With no keys, remove all of them.
   ignore DATASET ...     Leave these datasets out of sanoid.conf.
   unignore DATASET ...   Discover these datasets again.
-  template show          Print [template_production] (or default_template).
-  template set KEY=VALUE ...
-                         Change that template, then sync.
+  template show NAME     Print [template_NAME] from sanoid.conf.template.
+  template set NAME KEY=VALUE ...
+                         Change that template, then sync. NAME is the short
+                         name (production, backup), not the word "template".
 
 Options:
   --conf-dir DIR         Config directory (default: /etc/sanoid).
@@ -84,7 +86,9 @@ Examples:
   sanoid-config set data1/orcd use_template=backup
   sanoid-config set data1/edboyden recursive=yes
   sanoid-config ignore data1/scratch
-  sanoid-config template set hourly=4 daily=2 monthly=1
+  sanoid-config template show production
+  sanoid-config template set production hourly=4 daily=2 monthly=1
+  sanoid-config template set backup hourly=30 daily=90
   sanoid-config sync --dry-run
 
 Files:
@@ -777,7 +781,7 @@ cmd_sync() {
 # SANOID-CONFIG-MANAGED
 # Written by sanoid-config. Dataset sections are replaced on each sync.
 # Uniform retention is [template_${DEFAULT_TEMPLATE}] in ${TEMPLATE}.
-#   sanoid-config template set hourly=3 daily=1 monthly=0
+#   sanoid-config template set production hourly=3 daily=1 monthly=0
 # A new dataset is added here and com.sun:auto-snapshot is set to true.
 #   sanoid-config disable data1/edboyden
 #   sanoid-config set data1/edboyden hourly=6 daily=7
@@ -1043,11 +1047,18 @@ cmd_unignore() {
   cmd_sync 0
 }
 
+require_named_template() {
+  local name=$1
+  [[ "${name}" =~ ^[A-Za-z0-9_]+$ ]] || die "Template name '${name}' is not valid. Use the short name: sanoid-config template set production hourly=4"
+  [[ -v "TEMPLATE_HAS[${name}]" ]] || die "No [template_${name}] section in ${TEMPLATE}."
+}
+
 print_template_section() {
+  local name=$1
   local line in=0
   in=0
   while IFS= read -r line || [[ -n "${line}" ]]; do
-    if [[ "${line}" =~ ^[[:space:]]*\[template_"${DEFAULT_TEMPLATE}"\][[:space:]]*$ ]]; then
+    if [[ "${line}" =~ ^[[:space:]]*\[template_"${name}"\][[:space:]]*$ ]]; then
       in=1
       printf '%s\n' "${line}"
       continue
@@ -1073,12 +1084,13 @@ append_new_template_keys() {
 
 rewrite_template_to() {
   local dest=$1
+  local name=$2
   local -a lines=() out=()
   local i start=-1 end line key
   mapfile -t lines < "${TEMPLATE}"
   end=${#lines[@]}
   for i in "${!lines[@]}"; do
-    if [[ "${lines[$i]}" =~ ^[[:space:]]*\[template_"${DEFAULT_TEMPLATE}"\][[:space:]]*$ ]]; then
+    if [[ "${lines[$i]}" =~ ^[[:space:]]*\[template_"${name}"\][[:space:]]*$ ]]; then
       start=$i
       continue
     fi
@@ -1087,7 +1099,7 @@ rewrite_template_to() {
       break
     fi
   done
-  [[ "${start}" -ge 0 ]] || die "No [template_${DEFAULT_TEMPLATE}] section in ${TEMPLATE}."
+  [[ "${start}" -ge 0 ]] || die "No [template_${name}] section in ${TEMPLATE}."
   unset DONE
   declare -A DONE=()
   for i in "${!lines[@]}"; do
@@ -1112,20 +1124,29 @@ rewrite_template_to() {
 }
 
 cmd_template_show() {
-  [[ "${#ARGS[@]}" -le 1 ]] || die "Usage: sanoid-config template show"
+  local name
+  [[ "${#ARGS[@]}" -eq 2 ]] || die "Usage: sanoid-config template show NAME"
+  name=${ARGS[1]}
   load_discover
   load_template_names
-  printf '# %s [template_%s]\n' "${TEMPLATE}" "${DEFAULT_TEMPLATE}"
-  print_template_section
+  require_named_template "${name}"
+  printf '# %s [template_%s]\n' "${TEMPLATE}" "${name}"
+  print_template_section "${name}"
 }
 
 cmd_template_set() {
-  local arg key val normalized tmp
+  local name arg key val normalized tmp
   local -a kvs=()
-  kvs=("${ARGS[@]:1}")
-  [[ "${#kvs[@]}" -gt 0 ]] || die "Usage: sanoid-config template set KEY=VALUE ..."
+  [[ "${#ARGS[@]}" -ge 2 ]] || die "Usage: sanoid-config template set NAME KEY=VALUE ..."
+  name=${ARGS[1]}
+  if [[ "${name}" == *=* ]]; then
+    die "Name the template before the settings: sanoid-config template set production ${name}"
+  fi
+  kvs=("${ARGS[@]:2}")
+  [[ "${#kvs[@]}" -gt 0 ]] || die "Usage: sanoid-config template set ${name} KEY=VALUE ..."
   load_discover
   load_template_names
+  require_named_template "${name}"
   load_allowed
   unset NEWVAL SET_ORDER
   declare -gA NEWVAL=()
@@ -1146,7 +1167,7 @@ cmd_template_set() {
     NEWVAL["${key}"]=${normalized}
   done
   tmp=$(mktemp "${CONF_DIR}/sanoid.conf.template.tmp.XXXXXX")
-  rewrite_template_to "${tmp}"
+  rewrite_template_to "${tmp}" "${name}"
   if [[ "${DRY}" -eq 1 ]]; then
     TEMPLATE=${tmp}
     cmd_sync 1
@@ -1156,8 +1177,8 @@ cmd_template_set() {
   acquire_lock
   chmod 0644 "${tmp}"
   mv -f "${tmp}" "${TEMPLATE}"
-  info "updated [template_${DEFAULT_TEMPLATE}] in ${TEMPLATE}"
-  info "A later install-sanoid-rhel.sh replaces that file from sanoid/sanoid.conf."
+  info "updated [template_${name}] in ${TEMPLATE}"
+  info "A later install-sanoid-rhel.sh replaces that file from the repository sanoid.conf."
   cmd_sync 1
 }
 
@@ -1220,7 +1241,7 @@ cmd_template() {
   case "${sub}" in
     show) cmd_template_show ;;
     set) cmd_template_set ;;
-    *) die "Usage: sanoid-config template show|set KEY=VALUE ..." ;;
+    *) die "Usage: sanoid-config template show NAME, or template set NAME KEY=VALUE ..." ;;
   esac
 }
 
